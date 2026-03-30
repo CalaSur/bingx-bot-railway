@@ -244,27 +244,31 @@ def get_klines(symbol, interval="15m", limit=300):
 def compute_indicators(df):
     df = df.copy()
 
-    # EMA 200
+    # EMA 20 / 50 / 200
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
 
-    # RSI 14
+    # RSI 14 estilo TradingView / Wilder (RMA)
     delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean().replace(0, 1e-9)
+    # Wilder smoothing = alpha=1/length
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean().replace(0, 1e-9)
 
     rs = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # ATR 14
+    # ATR 14 estilo Wilder
     prev_close = df["close"].shift(1)
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - prev_close).abs()
     tr3 = (df["low"] - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(14).mean()
+
+    df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
     df["atr_pct"] = (df["atr"] / df["close"]) * 100
 
     return df
@@ -273,11 +277,15 @@ def compute_indicators(df):
 # STRATEGY
 # =========================
 def check_signal(df):
+    # Usar SIEMPRE la última vela cerrada, no la vela viva
     if len(df) < 220:
         return {"signal": "NO_DATA"}
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # -1 = vela actual (puede estar abierta)
+    # -2 = última cerrada
+    # -3 = vela anterior a la cerrada
+    last = df.iloc[-2]
+    prev = df.iloc[-3]
 
     close = float(last["close"])
     ema200 = float(last["ema200"])
@@ -291,6 +299,7 @@ def check_signal(df):
 
     signal = "NO_TRADE"
 
+    # lógica actual (tu versión original)
     if close > ema200 and prev_rsi < 50 and rsi > 50 and vol_ok:
         signal = "LONG"
     elif close < ema200 and prev_rsi > 50 and rsi < 50 and vol_ok:
@@ -301,10 +310,12 @@ def check_signal(df):
         "close": round(close, 4),
         "ema200": round(ema200, 4),
         "rsi": round(rsi, 2),
+        "prev_rsi": round(prev_rsi, 2),
         "atr": round(atr, 4),
         "atr_pct": round(atr_pct, 3),
         "trend": trend,
-        "vol_ok": vol_ok
+        "vol_ok": vol_ok,
+        "candle_time": str(last["open_time"])
     }
 
 # =========================
@@ -439,7 +450,7 @@ def run_analysis(force_manual=False):
 
             df = compute_indicators(df)
 
-            current_candle_time = df.iloc[-1]["open_time"]
+            current_candle_time = df.iloc[-2]["open_time"]
 
             if symbol not in last_candle_times:
                 last_candle_times[symbol] = current_candle_time
