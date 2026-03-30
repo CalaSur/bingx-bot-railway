@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 # =========================
 # CONFIG
 # =========================
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]   # BingX futures format
 INTERVAL = "15m"   # 15m, 1h, 4h
 LIMIT = 300
 SLEEP_SECONDS = 20
@@ -15,6 +15,9 @@ SLEEP_SECONDS = 20
 USE_TELEGRAM = True
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Base API BingX
+BINGX_BASE_URL = "https://open-api.bingx.com"
 
 # =========================
 # LOG
@@ -44,61 +47,106 @@ def send_telegram(message):
         log(f"Error enviando Telegram: {e}")
 
 # =========================
-# INTERVAL MAP
+# BINGX INTERVAL MAP
 # =========================
-def bybit_interval(interval):
+def bingx_interval(interval):
     mapping = {
-        "1m": "1",
-        "3m": "3",
-        "5m": "5",
-        "15m": "15",
-        "30m": "30",
-        "1h": "60",
-        "2h": "120",
-        "4h": "240",
-        "6h": "360",
-        "12h": "720",
-        "1d": "D"
+        "1m": "1m",
+        "3m": "3m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1h",
+        "2h": "2h",
+        "4h": "4h",
+        "6h": "6h",
+        "8h": "8h",
+        "12h": "12h",
+        "1d": "1d"
     }
-    return mapping.get(interval, "15")
+    return mapping.get(interval, "15m")
 
 # =========================
-# GET DATA FROM BYBIT
+# GET DATA FROM BINGX FUTURES
 # =========================
 def get_klines(symbol, interval="15m", limit=300):
-    url = "https://api.bybit.com/v5/market/kline"
+    """
+    BingX Perpetual Futures public klines
+    Endpoint doc family:
+    /openApi/swap/v3/quote/klines
+    """
+    url = f"{BINGX_BASE_URL}/openApi/swap/v3/quote/klines"
     params = {
-        "category": "linear",
         "symbol": symbol,
-        "interval": bybit_interval(interval),
+        "interval": bingx_interval(interval),
         "limit": limit
     }
 
-    r = requests.get(url, params=params, timeout=20)
+    headers = {
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0"
+    }
+
+    r = requests.get(url, params=params, headers=headers, timeout=20)
     r.raise_for_status()
     data = r.json()
 
-    if data.get("retCode") != 0:
-        raise Exception(f"Bybit error: {data}")
-
-    rows = data["result"]["list"]
+    # Algunos endpoints BingX devuelven data directo, otros dentro de "data"
+    rows = None
+    if isinstance(data, dict):
+        if "data" in data and isinstance(data["data"], list):
+            rows = data["data"]
+        elif "data" in data and isinstance(data["data"], dict):
+            # a veces puede venir dentro de data -> klines/list
+            if "klines" in data["data"]:
+                rows = data["data"]["klines"]
+            elif "list" in data["data"]:
+                rows = data["data"]["list"]
+        elif "result" in data and isinstance(data["result"], list):
+            rows = data["result"]
 
     if not rows:
-        raise Exception(f"No data for {symbol}")
+        raise Exception(f"Respuesta inesperada de BingX: {data}")
 
-    # Bybit devuelve orden descendente, lo damos vuelta
-    rows = rows[::-1]
+    # Normalizamos distintos formatos posibles
+    parsed = []
+    for row in rows:
+        # Caso lista estilo [time, open, high, low, close, volume, ...]
+        if isinstance(row, list):
+            if len(row) >= 6:
+                parsed.append({
+                    "open_time": row[0],
+                    "open": row[1],
+                    "high": row[2],
+                    "low": row[3],
+                    "close": row[4],
+                    "volume": row[5]
+                })
+        # Caso dict
+        elif isinstance(row, dict):
+            parsed.append({
+                "open_time": row.get("time") or row.get("openTime") or row.get("timestamp"),
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
+                "volume": row.get("volume", 0)
+            })
 
-    df = pd.DataFrame(rows, columns=[
-        "open_time", "open", "high", "low", "close", "volume", "turnover"
-    ])
+    if not parsed:
+        raise Exception(f"No se pudieron parsear klines de BingX: {data}")
 
+    df = pd.DataFrame(parsed)
+
+    # tiempo ms
     df["open_time"] = pd.to_datetime(df["open_time"].astype("int64"), unit="ms", utc=True)
     df["open"] = df["open"].astype(float)
     df["high"] = df["high"].astype(float)
     df["low"] = df["low"].astype(float)
     df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
+
+    df = df.sort_values("open_time").reset_index(drop=True)
 
     return df
 
@@ -111,13 +159,13 @@ def compute_indicators(df):
     # EMA 200
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
 
-    # RSI 14
+    # RSI 14 (simple rolling)
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
 
     avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean().replace(0, 1e-9)
 
     rs = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
@@ -156,17 +204,11 @@ def check_signal(df):
 
     signal = "NO_TRADE"
 
-    # LONG:
-    # - precio arriba de EMA200
-    # - RSI cruza arriba de 50
-    # - volatilidad OK
+    # LONG: tendencia + cruce RSI 50 + volatilidad aceptable
     if close > ema200 and prev_rsi < 50 and rsi > 50 and vol_ok:
         signal = "LONG"
 
-    # SHORT:
-    # - precio abajo de EMA200
-    # - RSI cruza abajo de 50
-    # - volatilidad OK
+    # SHORT: tendencia + cruce RSI 50 + volatilidad aceptable
     elif close < ema200 and prev_rsi > 50 and rsi < 50 and vol_ok:
         signal = "SHORT"
 
@@ -192,13 +234,15 @@ def format_signal(symbol, state):
     atr = state["atr"]
     atr_pct = state["atr_pct"]
 
+    symbol_show = symbol.replace("-", "")
+
     if signal == "LONG":
         sl = round(close - (atr * 1.5), 4)
         tp1 = round(close + (atr * 1.5), 4)
         tp2 = round(close + (atr * 3.0), 4)
 
         return (
-            f"🟢 SEÑAL LONG - {symbol} ({INTERVAL})\n"
+            f"🟢 SEÑAL LONG - {symbol_show} ({INTERVAL})\n"
             f"Entrada aprox: {close}\n"
             f"EMA200: {ema200}\n"
             f"RSI: {rsi}\n"
@@ -215,7 +259,7 @@ def format_signal(symbol, state):
         tp2 = round(close - (atr * 3.0), 4)
 
         return (
-            f"🔴 SEÑAL SHORT - {symbol} ({INTERVAL})\n"
+            f"🔴 SEÑAL SHORT - {symbol_show} ({INTERVAL})\n"
             f"Entrada aprox: {close}\n"
             f"EMA200: {ema200}\n"
             f"RSI: {rsi}\n"
@@ -232,17 +276,20 @@ def format_signal(symbol, state):
 # MAIN LOOP
 # =========================
 def main():
-    log(f"Bot iniciado para {', '.join(SYMBOLS)} en {INTERVAL} (Bybit data)")
+    log(f"Bot iniciado para {', '.join(SYMBOLS)} en {INTERVAL} (BingX data)")
+    send_telegram(f"🤖 Bot ONLINE en Railway\nActivos: {', '.join([s.replace('-', '') for s in SYMBOLS])}\nTimeframe: {INTERVAL}\nFuente: BingX Futures")
 
     last_candle_times = {symbol: None for symbol in SYMBOLS}
     last_signal_sent = {symbol: None for symbol in SYMBOLS}
-
-    send_telegram(f"🤖 Bot ONLINE en Railway\nActivos: {', '.join(SYMBOLS)}\nTimeframe: {INTERVAL}\nFuente: Bybit")
 
     while True:
         for symbol in SYMBOLS:
             try:
                 df = get_klines(symbol, INTERVAL, LIMIT)
+
+                if len(df) < 50:
+                    log(f"{symbol} - Pocas velas recibidas: {len(df)}")
+
                 df = compute_indicators(df)
 
                 current_candle_time = df.iloc[-1]["open_time"]
