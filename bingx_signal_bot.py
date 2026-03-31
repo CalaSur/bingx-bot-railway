@@ -2,530 +2,475 @@ import os
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+import numpy as np
+from datetime import datetime, timezone
 
 # =========================
 # CONFIG
 # =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PON_TU_TOKEN_AQUI")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PON_TU_CHAT_ID_AQUI")
+
 SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
-INTERVAL = "15m"         # 15m, 1h, 4h
-LIMIT = 300
-SLEEP_SECONDS = 20
+INTERVAL = "15m"
+CHECK_EVERY_SECONDS = 60
 
-USE_TELEGRAM = True
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+# V2 PARAMS
+EMA_FAST = 20
+EMA_MID = 50
+EMA_TREND = 200
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+VOL_MA_PERIOD = 20
 
-BINGX_BASE_URL = "https://open-api.bingx.com"
+# Filtros V2
+MIN_ATR_PCT = 0.25   # volatilidad mínima
+LONG_RSI_MIN = 55
+LONG_RSI_MAX = 72
+SHORT_RSI_MIN = 28
+SHORT_RSI_MAX = 45
 
-# Heartbeat cada X horas
-HEARTBEAT_HOURS = 4
+# Anti-duplicados
+last_candle_time = {}
+last_signal_sent = {}  # guarda "SYMBOL-candleTime-signal"
 
-# Resumen diario a esta hora UTC
-DAILY_SUMMARY_HOUR_UTC = 0
+# Telegram update offset
+telegram_offset = None
 
-# =========================
-# ESTADO GLOBAL
-# =========================
-last_update_id = None
-last_heartbeat_time = None
-last_daily_summary_date = None
-
-# para evitar señales repetidas
-last_candle_times = {}
-last_signal_sent = {}
-
-# stats del día
-daily_stats = {
-    "BTC-USDT": {"LONG": 0, "SHORT": 0},
-    "ETH-USDT": {"LONG": 0, "SHORT": 0},
-    "SOL-USDT": {"LONG": 0, "SHORT": 0},
-}
 
 # =========================
-# LOG
+# UTILS
 # =========================
 def log(msg):
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC] {msg}", flush=True)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{now}] {msg}", flush=True)
 
-# =========================
-# TELEGRAM
-# =========================
-def send_telegram(message):
-    if not USE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram no configurado.")
+
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram no configurado. Saltando envío.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
+        "text": text
     }
 
     try:
-        r = requests.post(url, data=payload, timeout=15)
-        r.raise_for_status()
-        log("Telegram enviado correctamente.")
-        return True
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code == 200:
+            log("Telegram enviado correctamente.")
+            return True
+        else:
+            log(f"Error enviando Telegram: {r.status_code} - {r.text}")
+            return False
     except Exception as e:
-        log(f"Error enviando Telegram: {e}")
+        log(f"Excepción enviando Telegram: {e}")
         return False
 
-# =========================
-# TELEGRAM COMMANDS (polling)
-# =========================
-def get_telegram_updates():
-    global last_update_id
 
+def get_telegram_updates():
+    global telegram_offset
     if not TELEGRAM_BOT_TOKEN:
         return []
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {
-        "timeout": 1
-    }
-
-    if last_update_id is not None:
-        params["offset"] = last_update_id + 1
+    params = {"timeout": 1}
+    if telegram_offset is not None:
+        params["offset"] = telegram_offset
 
     try:
         r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
         data = r.json()
-
         if not data.get("ok"):
             return []
 
-        updates = data.get("result", [])
-        if updates:
-            last_update_id = updates[-1]["update_id"]
-
-        return updates
+        results = data.get("result", [])
+        if results:
+            telegram_offset = results[-1]["update_id"] + 1
+        return results
     except Exception as e:
-        log(f"Error leyendo comandos Telegram: {e}")
+        log(f"Error getUpdates Telegram: {e}")
         return []
 
-def process_telegram_commands():
-    updates = get_telegram_updates()
-
-    for upd in updates:
-        try:
-            message = upd.get("message", {})
-            text = str(message.get("text", "")).strip()
-            chat_id = str(message.get("chat", {}).get("id", "")).strip()
-
-            # Seguridad: solo responde a tu chat
-            if chat_id != TELEGRAM_CHAT_ID:
-                log(f"Ignorando comando de chat no autorizado: {chat_id}")
-                continue
-
-            if text == "/start":
-                send_telegram(
-                    "🤖 Bot activo.\n\n"
-                    "Comandos disponibles:\n"
-                    "/status - estado del bot\n"
-                    "/check - análisis inmediato\n"
-                    "/help - ayuda"
-                )
-
-            elif text == "/help":
-                send_telegram(
-                    "📘 Comandos:\n"
-                    "/status - estado del bot\n"
-                    "/check - fuerza análisis ahora\n"
-                    "/help - ver comandos"
-                )
-
-            elif text == "/status":
-                send_telegram(build_status_message())
-
-            elif text == "/check":
-                send_telegram("🔎 Ejecutando análisis manual...")
-                run_analysis(force_manual=True)
-
-        except Exception as e:
-            log(f"Error procesando comando Telegram: {e}")
 
 # =========================
-# BINGX INTERVAL MAP
+# BINGX MARKET DATA
 # =========================
-def bingx_interval(interval):
-    mapping = {
-        "1m": "1m",
-        "3m": "3m",
-        "5m": "5m",
-        "15m": "15m",
-        "30m": "30m",
-        "1h": "1h",
-        "2h": "2h",
-        "4h": "4h",
-        "6h": "6h",
-        "8h": "8h",
-        "12h": "12h",
-        "1d": "1d"
-    }
-    return mapping.get(interval, "15m")
-
-# =========================
-# GET DATA FROM BINGX FUTURES
-# =========================
-def get_klines(symbol, interval="15m", limit=300):
-    url = f"{BINGX_BASE_URL}/openApi/swap/v3/quote/klines"
+def fetch_bingx_klines(symbol="BTC-USDT", interval="15m", limit=300):
+    """
+    BingX endpoint público (swap/linear)
+    """
+    url = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
     params = {
         "symbol": symbol,
-        "interval": bingx_interval(interval),
+        "interval": interval,
         "limit": limit
     }
 
-    headers = {
-        "accept": "application/json",
-        "user-agent": "Mozilla/5.0"
-    }
-
-    r = requests.get(url, params=params, headers=headers, timeout=20)
+    r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
 
-    rows = None
-    if isinstance(data, dict):
-        if "data" in data and isinstance(data["data"], list):
-            rows = data["data"]
-        elif "data" in data and isinstance(data["data"], dict):
-            if "klines" in data["data"]:
-                rows = data["data"]["klines"]
-            elif "list" in data["data"]:
-                rows = data["data"]["list"]
-        elif "result" in data and isinstance(data["result"], list):
-            rows = data["result"]
+    # Esperado: {"code":0,"msg":"","data":[...]}
+    if data.get("code") != 0:
+        raise Exception(f"BingX API error: {data}")
 
-    if not rows:
-        raise Exception(f"Respuesta inesperada de BingX: {data}")
+    klines = data.get("data", [])
+    if not klines or len(klines) < 50:
+        raise Exception(f"No hay suficientes velas para {symbol}")
 
-    parsed = []
-    for row in rows:
-        if isinstance(row, list):
-            if len(row) >= 6:
-                parsed.append({
-                    "open_time": row[0],
-                    "open": row[1],
-                    "high": row[2],
-                    "low": row[3],
-                    "close": row[4],
-                    "volume": row[5]
-                })
-        elif isinstance(row, dict):
-            parsed.append({
-                "open_time": row.get("time") or row.get("openTime") or row.get("timestamp"),
-                "open": row.get("open"),
-                "high": row.get("high"),
-                "low": row.get("low"),
-                "close": row.get("close"),
-                "volume": row.get("volume", 0)
-            })
+    rows = []
+    for k in klines:
+        # Campos comunes:
+        # time, open, high, low, close, volume
+        rows.append({
+            "time": pd.to_datetime(int(k["time"]), unit="ms", utc=True),
+            "open": float(k["open"]),
+            "high": float(k["high"]),
+            "low": float(k["low"]),
+            "close": float(k["close"]),
+            "volume": float(k["volume"]),
+        })
 
-    if not parsed:
-        raise Exception(f"No se pudieron parsear klines de BingX: {data}")
-
-    df = pd.DataFrame(parsed)
-
-    df["open_time"] = pd.to_datetime(df["open_time"].astype("int64"), unit="ms", utc=True)
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["volume"] = df["volume"].astype(float)
-
-    df = df.sort_values("open_time").reset_index(drop=True)
+    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
     return df
+
 
 # =========================
 # INDICATORS
 # =========================
-def compute_indicators(df):
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+
+def calculate_atr(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    prev_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    return atr
+
+
+def add_indicators(df):
     df = df.copy()
 
-    # EMA 20 / 50 / 200
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+    df["ema20"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
 
-    # RSI 14 estilo TradingView / Wilder (RMA)
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    # Wilder smoothing = alpha=1/length
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean().replace(0, 1e-9)
-
-    rs = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    # ATR 14 estilo Wilder
-    prev_close = df["close"].shift(1)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
+    df["atr"] = calculate_atr(df, ATR_PERIOD)
     df["atr_pct"] = (df["atr"] / df["close"]) * 100
+
+    df["vol_ma"] = df["volume"].rolling(VOL_MA_PERIOD).mean()
 
     return df
 
-# =========================
-# STRATEGY
-# =========================
-def check_signal(df):
-    # Usar SIEMPRE la última vela cerrada, no la vela viva
-    if len(df) < 220:
-        return {"signal": "NO_DATA"}
 
-    # -1 = vela actual (puede estar abierta)
-    # -2 = última cerrada
-    # -3 = vela anterior a la cerrada
-    last = df.iloc[-2]
-    prev = df.iloc[-3]
+# =========================
+# STRATEGY V2
+# =========================
+def generate_signal_v2(df):
+    """
+    Usa la última vela CERRADA.
+    """
+    if len(df) < 220:
+        return {"signal": "NO_TRADE", "reason": "not_enough_data"}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
     close = float(last["close"])
+    ema20 = float(last["ema20"])
+    ema50 = float(last["ema50"])
     ema200 = float(last["ema200"])
     rsi = float(last["rsi"])
-    prev_rsi = float(prev["rsi"])
     atr = float(last["atr"])
     atr_pct = float(last["atr_pct"])
+    volume = float(last["volume"])
+    vol_ma = float(last["vol_ma"]) if not pd.isna(last["vol_ma"]) else 0.0
 
+    prev_high = float(prev["high"])
+    prev_low = float(prev["low"])
+
+    vol_ok = volume >= vol_ma if vol_ma > 0 else True
+
+    # Tendencia
+    long_trend = close > ema200 and ema20 > ema50
+    short_trend = close < ema200 and ema20 < ema50
+
+    # Momentum
+    long_momentum = LONG_RSI_MIN <= rsi <= LONG_RSI_MAX
+    short_momentum = SHORT_RSI_MIN <= rsi <= SHORT_RSI_MAX
+
+    # Confirmación
+    long_break = close > prev_high
+    short_break = close < prev_low
+
+    # Volatilidad
+    volat_ok = atr_pct >= MIN_ATR_PCT
+
+    # LONG
+    if long_trend and long_momentum and long_break and volat_ok and vol_ok:
+        entry = close
+        sl = entry - (atr * 1.5)
+        tp1 = entry + (atr * 1.5)
+        tp2 = entry + (atr * 3.0)
+
+        return {
+            "signal": "LONG",
+            "close": round(close, 4),
+            "ema20": round(ema20, 4),
+            "ema50": round(ema50, 4),
+            "ema200": round(ema200, 4),
+            "rsi": round(rsi, 2),
+            "atr": round(atr, 4),
+            "atr_pct": round(atr_pct, 3),
+            "vol_ok": bool(vol_ok),
+            "prev_high": round(prev_high, 4),
+            "entry": round(entry, 4),
+            "sl": round(sl, 4),
+            "tp1": round(tp1, 4),
+            "tp2": round(tp2, 4),
+        }
+
+    # SHORT
+    if short_trend and short_momentum and short_break and volat_ok and vol_ok:
+        entry = close
+        sl = entry + (atr * 1.5)
+        tp1 = entry - (atr * 1.5)
+        tp2 = entry - (atr * 3.0)
+
+        return {
+            "signal": "SHORT",
+            "close": round(close, 4),
+            "ema20": round(ema20, 4),
+            "ema50": round(ema50, 4),
+            "ema200": round(ema200, 4),
+            "rsi": round(rsi, 2),
+            "atr": round(atr, 4),
+            "atr_pct": round(atr_pct, 3),
+            "vol_ok": bool(vol_ok),
+            "prev_low": round(prev_low, 4),
+            "entry": round(entry, 4),
+            "sl": round(sl, 4),
+            "tp1": round(tp1, 4),
+            "tp2": round(tp2, 4),
+        }
+
+    # Estado informativo
     trend = "LONG_BIAS" if close > ema200 else "SHORT_BIAS"
-    vol_ok = 0.25 <= atr_pct <= 3.0
-
-    signal = "NO_TRADE"
-
-    # lógica actual (tu versión original)
-    if close > ema200 and prev_rsi < 50 and rsi > 50 and vol_ok:
-        signal = "LONG"
-    elif close < ema200 and prev_rsi > 50 and rsi < 50 and vol_ok:
-        signal = "SHORT"
 
     return {
-        "signal": signal,
+        "signal": "NO_TRADE",
         "close": round(close, 4),
+        "ema20": round(ema20, 4),
+        "ema50": round(ema50, 4),
         "ema200": round(ema200, 4),
         "rsi": round(rsi, 2),
-        "prev_rsi": round(prev_rsi, 2),
         "atr": round(atr, 4),
         "atr_pct": round(atr_pct, 3),
         "trend": trend,
-        "vol_ok": vol_ok,
-        "candle_time": str(last["open_time"])
+        "vol_ok": bool(vol_ok),
+        "long_break": bool(long_break),
+        "short_break": bool(short_break),
     }
 
-# =========================
-# FORMAT SIGNAL
-# =========================
-def format_signal(symbol, state):
-    signal = state["signal"]
-    close = state["close"]
-    ema200 = state["ema200"]
-    rsi = state["rsi"]
-    atr = state["atr"]
-    atr_pct = state["atr_pct"]
 
-    symbol_show = symbol.replace("-", "")
+# =========================
+# MESSAGE FORMAT
+# =========================
+def format_signal_message(symbol, interval, candle_time, signal_data):
+    signal = signal_data["signal"]
 
     if signal == "LONG":
-        sl = round(close - (atr * 1.5), 4)
-        tp1 = round(close + (atr * 1.5), 4)
-        tp2 = round(close + (atr * 3.0), 4)
-
         return (
-            f"🟢 SEÑAL LONG - {symbol_show} ({INTERVAL})\n"
-            f"Entrada aprox: {close}\n"
-            f"EMA200: {ema200}\n"
-            f"RSI: {rsi}\n"
-            f"ATR: {atr} ({atr_pct}%)\n"
-            f"SL: {sl}\n"
-            f"TP1: {tp1}\n"
-            f"TP2: {tp2}\n"
-            f"Riesgo sugerido: 0.5% - 1% por trade"
+            f"🟢 ALERTA LONG - {symbol.replace('-', '')} ({interval})\n\n"
+            f"📍 Hora vela: {candle_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"Entrada aprox: {signal_data['entry']}\n\n"
+            f"📊 Confirmaciones:\n"
+            f"- Precio > EMA200\n"
+            f"- EMA20 > EMA50\n"
+            f"- RSI: {signal_data['rsi']}\n"
+            f"- Rompió máximo vela anterior\n"
+            f"- ATR%: {signal_data['atr_pct']}\n"
+            f"- Volumen OK: {signal_data['vol_ok']}\n\n"
+            f"🛡 SL: {signal_data['sl']}\n"
+            f"🎯 TP1: {signal_data['tp1']}\n"
+            f"🎯 TP2: {signal_data['tp2']}\n\n"
+            f"⚠️ Revisar gráfico antes de entrar\n"
+            f"💰 Riesgo sugerido: 0.5% - 1% por trade"
         )
 
     elif signal == "SHORT":
-        sl = round(close + (atr * 1.5), 4)
-        tp1 = round(close - (atr * 1.5), 4)
-        tp2 = round(close - (atr * 3.0), 4)
-
         return (
-            f"🔴 SEÑAL SHORT - {symbol_show} ({INTERVAL})\n"
-            f"Entrada aprox: {close}\n"
-            f"EMA200: {ema200}\n"
-            f"RSI: {rsi}\n"
-            f"ATR: {atr} ({atr_pct}%)\n"
-            f"SL: {sl}\n"
-            f"TP1: {tp1}\n"
-            f"TP2: {tp2}\n"
-            f"Riesgo sugerido: 0.5% - 1% por trade"
+            f"🔴 ALERTA SHORT - {symbol.replace('-', '')} ({interval})\n\n"
+            f"📍 Hora vela: {candle_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"Entrada aprox: {signal_data['entry']}\n\n"
+            f"📊 Confirmaciones:\n"
+            f"- Precio < EMA200\n"
+            f"- EMA20 < EMA50\n"
+            f"- RSI: {signal_data['rsi']}\n"
+            f"- Rompió mínimo vela anterior\n"
+            f"- ATR%: {signal_data['atr_pct']}\n"
+            f"- Volumen OK: {signal_data['vol_ok']}\n\n"
+            f"🛡 SL: {signal_data['sl']}\n"
+            f"🎯 TP1: {signal_data['tp1']}\n"
+            f"🎯 TP2: {signal_data['tp2']}\n\n"
+            f"⚠️ Revisar gráfico antes de entrar\n"
+            f"💰 Riesgo sugerido: 0.5% - 1% por trade"
         )
 
-    return None
+    return (
+        f"🔎 {symbol.replace('-', '')} sin señal ahora.\n"
+        f"Hora vela: {candle_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Estado: {signal_data}"
+    )
+
 
 # =========================
-# STATUS MESSAGE
+# CHECK LOGIC
 # =========================
-def build_status_message():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def process_symbol(symbol, force_check=False, send_no_trade=False):
+    global last_candle_time, last_signal_sent
 
-    msg = [
-        "📡 ESTADO DEL BOT",
-        f"Hora: {now}",
-        f"Activos: {', '.join([s.replace('-', '') for s in SYMBOLS])}",
-        f"Timeframe: {INTERVAL}",
-        "",
-        "📊 Señales del día:"
-    ]
+    try:
+        df = fetch_bingx_klines(symbol=symbol, interval=INTERVAL, limit=300)
+        df = add_indicators(df)
 
-    for s in SYMBOLS:
-        longs = daily_stats[s]["LONG"]
-        shorts = daily_stats[s]["SHORT"]
-        msg.append(f"{s.replace('-', '')}: LONG={longs} | SHORT={shorts}")
+        # Última vela cerrada = última del dataframe (BingX ya suele traer cerradas en este endpoint)
+        candle = df.iloc[-1]
+        candle_time = candle["time"]
 
-    return "\n".join(msg)
+        # Inicialización: no mandar señal vieja al arrancar
+        if symbol not in last_candle_time:
+            last_candle_time[symbol] = candle_time
+            log(f"{symbol} - Inicializado en vela: {candle_time}")
+            if force_check:
+                signal_data = generate_signal_v2(df)
+                msg = format_signal_message(symbol, INTERVAL, candle_time, signal_data)
+                send_telegram_message(msg)
+            return
+
+        # Si no hay vela nueva y no es force_check, salir
+        if (not force_check) and candle_time == last_candle_time[symbol]:
+            return
+
+        # Actualizar vela vista
+        last_candle_time[symbol] = candle_time
+        log(f"{symbol} - Nueva vela cerrada: {candle_time}")
+
+        signal_data = generate_signal_v2(df)
+
+        if signal_data["signal"] in ["LONG", "SHORT"]:
+            signal_key = f"{symbol}-{candle_time}-{signal_data['signal']}"
+
+            if last_signal_sent.get(symbol) != signal_key or force_check:
+                msg = format_signal_message(symbol, INTERVAL, candle_time, signal_data)
+                send_telegram_message(msg)
+                last_signal_sent[symbol] = signal_key
+                log(f"{symbol} - Señal enviada: {signal_data['signal']}")
+            else:
+                log(f"{symbol} - Señal duplicada evitada.")
+        else:
+            log(f"{symbol} - Sin señal. Estado: {signal_data}")
+            if force_check and send_no_trade:
+                msg = format_signal_message(symbol, INTERVAL, candle_time, signal_data)
+                send_telegram_message(msg)
+
+    except Exception as e:
+        log(f"{symbol} - ERROR: {e}")
+
 
 # =========================
-# DAILY SUMMARY
+# TELEGRAM COMMANDS
 # =========================
-def maybe_send_daily_summary():
-    global last_daily_summary_date
-
-    now = datetime.now(timezone.utc)
-    today = now.date()
-
-    if now.hour == DAILY_SUMMARY_HOUR_UTC:
-        if last_daily_summary_date != today:
-            msg = ["📊 RESUMEN DIARIO"]
-            for s in SYMBOLS:
-                longs = daily_stats[s]["LONG"]
-                shorts = daily_stats[s]["SHORT"]
-                msg.append(f"{s.replace('-', '')}: LONG={longs} | SHORT={shorts}")
-
-            send_telegram("\n".join(msg))
-            last_daily_summary_date = today
-
-            # reset stats después de enviar
-            for s in SYMBOLS:
-                daily_stats[s]["LONG"] = 0
-                daily_stats[s]["SHORT"] = 0
-
-# =========================
-# HEARTBEAT
-# =========================
-def maybe_send_heartbeat():
-    global last_heartbeat_time
-
-    now = datetime.now(timezone.utc)
-
-    if last_heartbeat_time is None:
-        last_heartbeat_time = now
+def handle_telegram_commands():
+    updates = get_telegram_updates()
+    if not updates:
         return
 
-    if now - last_heartbeat_time >= timedelta(hours=HEARTBEAT_HOURS):
-        send_telegram(
-            f"💓 Bot sigue activo\n"
-            f"Hora UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Activos: {', '.join([s.replace('-', '') for s in SYMBOLS])}\n"
-            f"Timeframe: {INTERVAL}"
-        )
-        last_heartbeat_time = now
+    for upd in updates:
+        msg = upd.get("message", {})
+        text = msg.get("text", "")
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+
+        # Seguridad: responder solo a tu chat configurado
+        if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+            continue
+
+        if text == "/start":
+            send_telegram_message(
+                "🤖 Bot activo en Railway.\n\n"
+                "Comandos:\n"
+                "/check → revisar ahora\n"
+                "/status → estado del bot"
+            )
+
+        elif text == "/status":
+            send_telegram_message(
+                f"✅ Bot activo.\n"
+                f"Símbolos: {', '.join([s.replace('-', '') for s in SYMBOLS])}\n"
+                f"Timeframe: {INTERVAL}\n"
+                f"Estrategia: V2 (EMA200 + EMA20/50 + RSI + Breakout + ATR + Volumen)"
+            )
+
+        elif text == "/check":
+            send_telegram_message("🔎 Revisando mercado ahora...")
+            for symbol in SYMBOLS:
+                process_symbol(symbol, force_check=True, send_no_trade=True)
+
 
 # =========================
-# ANALYSIS LOOP
-# =========================
-def run_analysis(force_manual=False):
-    global last_candle_times, last_signal_sent
-
-    for symbol in SYMBOLS:
-        try:
-            df = get_klines(symbol, INTERVAL, LIMIT)
-
-            if len(df) < 50:
-                log(f"{symbol} - Pocas velas recibidas: {len(df)}")
-
-            df = compute_indicators(df)
-
-            current_candle_time = df.iloc[-2]["open_time"]
-
-            if symbol not in last_candle_times:
-                last_candle_times[symbol] = current_candle_time
-                last_signal_sent[symbol] = None
-                log(f"{symbol} - Inicializado en vela: {current_candle_time}")
-
-                if force_manual:
-                    state = check_signal(df)
-                    send_telegram(f"🔎 {symbol.replace('-', '')} análisis manual:\n{state}")
-
-                continue
-
-            # Si es manual, analiza aunque no haya vela nueva
-            if force_manual:
-                state = check_signal(df)
-
-                if state["signal"] in ["LONG", "SHORT"]:
-                    msg = format_signal(symbol, state)
-                    if msg:
-                        send_telegram(f"🔎 CHECK MANUAL\n{msg}")
-                else:
-                    send_telegram(f"🔎 {symbol.replace('-', '')} sin señal ahora.\nEstado: {state}")
-
-                continue
-
-            # Modo normal: solo cuando cierra nueva vela
-            if current_candle_time != last_candle_times[symbol]:
-                last_candle_times[symbol] = current_candle_time
-                log(f"{symbol} - Nueva vela cerrada: {current_candle_time}")
-
-                state = check_signal(df)
-
-                if state["signal"] in ["LONG", "SHORT"]:
-                    signal_key = f"{symbol}_{state['signal']}_{current_candle_time}"
-
-                    if last_signal_sent[symbol] != signal_key:
-                        msg = format_signal(symbol, state)
-                        if msg:
-                            log(f"{symbol} - Señal detectada: {state}")
-                            send_telegram(msg)
-                            last_signal_sent[symbol] = signal_key
-
-                            # stats
-                            daily_stats[symbol][state["signal"]] += 1
-                    else:
-                        log(f"{symbol} - Señal repetida evitada.")
-                else:
-                    log(f"{symbol} - Sin señal. Estado: {state}")
-
-        except Exception as e:
-            log(f"{symbol} - ERROR: {e}")
-
-# =========================
-# MAIN
+# MAIN LOOP
 # =========================
 def main():
-    log(f"Bot iniciado para {', '.join(SYMBOLS)} en {INTERVAL} (BingX data)")
-    send_telegram(
-        f"🤖 Bot ONLINE en Railway\n"
-        f"Activos: {', '.join([s.replace('-', '') for s in SYMBOLS])}\n"
+    log(f"Bot iniciado para {', '.join(SYMBOLS)} en {INTERVAL} (BingX data, V2)")
+
+    # Mensaje de inicio
+    send_telegram_message(
+        f"🚀 Bot iniciado en Railway\n"
+        f"Símbolos: {', '.join([s.replace('-', '') for s in SYMBOLS])}\n"
         f"Timeframe: {INTERVAL}\n"
-        f"Fuente: BingX Futures\n"
-        f"Comandos: /status /check /help"
+        f"Estrategia: V2"
     )
+
+    # Inicializar sin disparar señales viejas
+    for symbol in SYMBOLS:
+        process_symbol(symbol, force_check=False)
 
     while True:
         try:
-            process_telegram_commands()
-            run_analysis(force_manual=False)
-            maybe_send_heartbeat()
-            maybe_send_daily_summary()
-        except Exception as e:
-            log(f"ERROR GENERAL LOOP: {e}")
+            handle_telegram_commands()
 
-        time.sleep(SLEEP_SECONDS)
+            for symbol in SYMBOLS:
+                process_symbol(symbol, force_check=False)
+
+        except Exception as e:
+            log(f"Error en loop principal: {e}")
+
+        time.sleep(CHECK_EVERY_SECONDS)
+
 
 if __name__ == "__main__":
     main()
